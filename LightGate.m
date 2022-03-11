@@ -148,7 +148,9 @@ classdef LightGate
             hold(Ax,"on")
             Line = cell(2,1);
             Line{1} = plot(Ax,obj.Time,rescale(obj.Voltage),'LineWidth',0.5);
-            Line{2} = plot(Ax,obj.Time,obj.FittedCurve(1:numel(obj.Time)),'LineWidth',2);
+            if isa(obj.FittedCurve,class(cfit))
+                Line{2} = plot(Ax,obj.Time,obj.FittedCurve(1:numel(obj.Time)),'LineWidth',2);
+            end
         end
     end
 end
