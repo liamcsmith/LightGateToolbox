@@ -16,7 +16,7 @@ classdef LightGate
     %                     previously made box.
     %
     %   Installation:     You will need to alter the private property
-    %                     ScopeTracePath (Line 41) to satisy dependency.
+    %                     ScopeTracePath (Line 43) to satisy dependency.
     %
     %   Dependencies:
     %       ScopeTrace:   This is contained within the ImportScope repo, if
@@ -29,16 +29,18 @@ classdef LightGate
     properties
         RawData
         Delay
-        FittedCurve
-        TrigTime
-        Box
+        FittedCurve = []
     end
     properties (Dependent)
         Voltage
         Time
+        TrigTime
+        LightGateCache
     end
     properties (Access=private)
-        ScopeTracePath = '~/Documents/GitHub/ImportScope' % CHANGE ME TO INCLUDE ScopeTrace IN THE PATH
+        OuterBox        = []
+        InnerBox        = []
+        ScopeTracePath  = '~/Documents/GitHub/ImportScope' % CHANGE ME TO INCLUDE ScopeTrace IN THE PATH
     end
 
     methods
@@ -46,98 +48,112 @@ classdef LightGate
             arguments
                 inputargs.FilePath  = 'Undefined'
                 inputargs.Delay     = 0
+                inputargs.LoadCache = true
             end
-            if ~exist('ScopeTrace','file')
-                addpath(obj.ScopeTracePath);
-            end
-
+            obj.CheckDependency
+            obj.Delay = inputargs.Delay;
+            
+            % Load Oscilloscope File
             if isfile(inputargs.FilePath)
                 obj.RawData = ScopeTrace('FilePath',inputargs.FilePath);
             else
                 obj.RawData = ScopeTrace();
             end
-
-            obj.Delay = inputargs.Delay;
-
+            
+            % If Desired & Present Load the Cache & Fit and do not
+            % overwrite
+            if inputargs.LoadCache && isfile(obj.LightGateCache)
+                Cache           = load(obj.LightGateCache);
+                obj.OuterBox    = Cache.OuterBox;
+                obj.InnerBox    = Cache.InnerBox;
+                obj.FittedCurve = Cache.FittedCurve;
+                clearvars Cache
+            end
         end
         function obj = FitLightGate(obj,inputargs)
             arguments
                 obj
-                inputargs.Box = 'Undefined'
-                inputargs.PlotFlag = false
+                inputargs.Boxes     {mustBeA(inputargs.Boxes,'cell')}        = {[],[]}
+                inputargs.PlotFlag  {mustBeA(inputargs.PlotFlag,'logical')}  = false
+                inputargs.SaveCache {mustBeA(inputargs.SaveCache,'logical')} = true
             end
-            obj.Box = inputargs.Box;
-            if ~exist('ScopeTrace','file')
-                addpath(obj.ScopeTracePath);
-            end
-            
-            Signal = rescale(obj.Voltage);
-            
-            tmp         = rescale(movmean(Signal,20));
-            Crossover   = median(find(tmp>0.475 & tmp<0.525));
-            
-            if ischar(obj.Box)
-                plot(tmp);
-                title('Drag rectangle over transition region')
-                obj.Box = getrect();
-                close all
-                inputargs.PlotFlag = true;
-            end
+            obj.CheckDependency
 
-            PreSignalLevel  = median(Signal(1:round(obj.Box(1))));
-            PostSignalLevel = median(Signal(round(obj.Box(1)+obj.Box(3)):end));
+            obj.OuterBox = inputargs.Boxes{1};
+            obj.InnerBox = inputargs.Boxes{2};
+            
+            Signal = rescale(movmean(obj.Voltage,50));
+            Idx    = (1:numel(Signal))';
+
+            % Outer Box Filter
+            if isempty(obj.OuterBox)
+                plot(Idx,Signal);
+                title('Drag rectangle over larger transition region (well before to well after fall)')
+                drawnow
+                obj.OuterBox = round(getrect());
+            end
+            [Idx,Signal] = obj.BoxCrop(Idx,Signal,obj.OuterBox);
+            
+            % Inner Box Filter
+            if isempty(obj.InnerBox)
+                plot(Idx,Signal);
+                title('Drag rectangle over smaller transition region (just the fall)')
+                drawnow
+                obj.InnerBox = round(getrect());
+                close(gcf)
+            end
+            [Idx_Inner,Signal_Inner] = obj.BoxCrop(Idx,Signal,obj.InnerBox);
+                    
+            Crossover       = Idx_Inner(round(median(find(abs(Signal_Inner-0.5)<0.05))));
+            
+            FallStartIdx    = obj.InnerBox(1);
+            FallEndIdx      = obj.InnerBox(1) + obj.InnerBox(3);
+            
+            Signal = obj.Voltage;
+            [~,Signal]      = obj.BoxCrop(1:numel(Signal),Signal,obj.OuterBox);
+            PreSignalLevel  = mean(Signal(Idx < FallStartIdx ));
+            PostSignalLevel = mean(Signal(Idx > FallEndIdx   ));
+
             Amplitude       = range([PreSignalLevel,PostSignalLevel])/2;
+            FallWidth       = range([FallStartIdx,FallEndIdx]);
             
-            [xData, yData] = prepareCurveData([],Signal);
+            [xData, yData]  = prepareCurveData(Idx,Signal);
             
-            opts             = fitoptions('Method','NonlinearLeastSquares');
-            opts.Display     = 'Off';
-            opts.MaxFunEvals = 100000;
-            opts.MaxIter     = 100000;
-            opts.TolFun      = 1e-07;
-            opts.TolX        = 1e-07;
-            opts.Lower       = [0.75*Amplitude  0               obj.Box(1)              PostSignalLevel-0.2];
-            opts.StartPoint  = [Amplitude       4/obj.Box(3)    Crossover               PostSignalLevel];
-            opts.Upper       = [1.25*Amplitude  Inf             (obj.Box(1)+obj.Box(3)) PostSignalLevel+0.2 ];
+            opts                = fitoptions('Method','NonlinearLeastSquares');
+            opts.Display        = 'Off';
+            opts.MaxFunEvals    = 100000;
+            opts.MaxIter        = 100000;
+            opts.TolFun         = 1e-07;
+            opts.TolX           = 1e-07;
+            opts.Lower          = [0.75*Amplitude  0            FallStartIdx PostSignalLevel-0.2];
+            opts.StartPoint     = [Amplitude       4/FallWidth  Crossover    PostSignalLevel];
+            opts.Upper          = [1.25*Amplitude  Inf          FallEndIdx   PostSignalLevel+0.2 ];
+            opts.DiffMaxChange  = 10;
             
-            [obj.FittedCurve, ~] = fit(xData,...
-                                       yData,...
+            [obj.FittedCurve, ~] = fit(xData,yData,...
                                        fittype('a*erfc(b*(x-c))+d',...
-                                               'independent',...
-                                               'x',...
-                                               'dependent',...
-                                               'y'),...
-                                       opts );
-
-            TriggerIdx = coeffvalues(obj.FittedCurve);
-            TriggerIdx = TriggerIdx(3);
-            obj.TrigTime = interp1(1:numel(obj.Time),obj.Time,TriggerIdx);
-
-            ErrorVal = confint(obj.FittedCurve);
-            ErrorVal = range(ErrorVal(:,3))*(obj.RawData.Time(2)-obj.RawData.Time(1));
-            obj.TrigTime(2) = ErrorVal/2;
+                                               'independent','x',...
+                                               'dependent','y'),opts);
+            
+            if inputargs.SaveCache
+                if isfile(obj.LightGateCache)
+                    delete(obj.LightGateCache)
+                end
+                Cache = struct('OuterBox'   ,obj.OuterBox, ...
+                               'InnerBox'   ,obj.InnerBox, ...
+                               'FittedCurve',obj.FittedCurve);
+                save(obj.LightGateCache,'-struct','Cache');
+            end
             
             if inputargs.PlotFlag
-                plot(Signal)
-                hold on
-                plot(obj.FittedCurve)
-                hold off
-                disp('Press any key to continue')
+                Fig = figure();
+                Ax  = axes(Fig);
+                [Fig] = obj.PlotLightGate(Fig,Ax);
+                title(Ax,'Press any button to close')
                 pause
-                close all
+                close(Fig)
             end
-        end
-        function Time = get.Time(obj)
-            if ~exist('ScopeTrace','file')
-                addpath(obj.ScopeTracePath);
-            end
-            Time = obj.RawData.Time - obj.Delay;
-        end
-        function Voltage = get.Voltage(obj)
-            if ~exist('ScopeTrace','file')
-                addpath(obj.ScopeTracePath);
-            end
-            Voltage = obj.RawData.Voltage;
+            
         end
         function [Fig,Ax,Line] = PlotLightGate(obj,Fig,Ax)
             arguments
@@ -146,11 +162,67 @@ classdef LightGate
                 Ax  = axes(Fig)
             end
             hold(Ax,"on")
-            Line = cell(2,1);
-            Line{1} = plot(Ax,obj.Time,rescale(obj.Voltage),'LineWidth',0.5);
+            Line = cell(3,1);
+            [XIdx,Y] = obj.BoxCrop((1:numel(obj.Time))',obj.Voltage,obj.OuterBox);
+
+            Line{1} = plot(Ax,obj.Time(XIdx),Y,'LineWidth',0.5);
             if isa(obj.FittedCurve,class(cfit))
-                Line{2} = plot(Ax,obj.Time,obj.FittedCurve(1:numel(obj.Time)),'LineWidth',2);
+                Line{2} = plot(Ax,obj.Time(XIdx),obj.FittedCurve(XIdx),'LineWidth',2);
+                Line{3} = xline(Ax,obj.TrigTime(1),'LineWidth',2);
             end
+        end
+    end
+    methods
+        function Time           = get.Time(obj)
+            if ~exist('ScopeTrace','file')
+                addpath(obj.ScopeTracePath);
+            end
+            Time = obj.RawData.Time - obj.Delay;
+        end
+        function Voltage        = get.Voltage(obj)
+            if ~exist('ScopeTrace','file')
+                addpath(obj.ScopeTracePath);
+            end
+            Voltage = obj.RawData.Voltage;
+        end
+        function Filename       = get.LightGateCache(obj)
+            Filename = '';
+            if isa(obj.RawData,'ScopeTrace')
+                if isfile(obj.RawData.FilePath)
+                    Filename = split(obj.RawData.FilePath,'.');
+                    Filename = [Filename{1},'_LightGateCache.mat'];
+                end
+            end
+        end
+        function TrigTime       = get.TrigTime(obj)
+            TrigTime = [];
+            if isa(obj.FittedCurve,class(cfit))
+                TriggerIdx = coeffvalues(obj.FittedCurve);
+                
+                tmp         = obj.Time;
+                TrigTime    = interp1(1:numel(tmp),tmp,TriggerIdx(3));
+                
+                ErrorVals    = confint(obj.FittedCurve);
+                TrigTime(2) = 0.5*range(ErrorVals(:,3))*mean(diff(obj.RawData.Time));
+            end
+        end
+        function CheckDependency(obj)
+            if ~exist('ScopeTrace','file')
+                addpath(obj.ScopeTracePath);
+            end
+        end
+    end
+    methods (Static)
+        function [Time,Voltage] = BoxCrop(Time,Voltage,Box)
+            
+            MinIdx = Box(1);
+            MaxIdx = Box(1) + Box(3);
+            Idx = Time>MinIdx & Time<MaxIdx;
+            
+
+            Time    = Time(Idx);
+            Voltage = rescale(Voltage(Idx));
+
         end
     end
 end
